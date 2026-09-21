@@ -3,6 +3,72 @@
 #include <tlhelp32.h>
 #include <string>
 #include <filesystem>
+// Функция создания скриншота экрана и сохранения его в файл BMP
+bool TakeScreenshot(const std::string& filename) {
+    // 1. Получаем размеры экрана
+    int width = GetSystemMetrics(SM_CXSCREEN);
+    int height = GetSystemMetrics(SM_CYSCREEN);
+
+    // 2. Получаем контекст устройства (экран)
+    HWND hDesktopWnd = GetDesktopWindow();
+    HDC hDesktopDC = GetDC(hDesktopWnd);
+    HDC hCaptureDC = CreateCompatibleDC(hDesktopDC);
+
+    // 3. Создаем пустую картинку в памяти под размеры экрана
+    HBITMAP hCaptureBitmap = CreateCompatibleBitmap(hDesktopDC, width, height);
+    SelectObject(hCaptureDC, hCaptureBitmap);
+
+    // 4. Копируем пиксели с экрана на нашу картинку (само фото)
+    if (!BitBlt(hCaptureDC, 0, 0, width, height, hDesktopDC, 0, 0, SRCCOPY)) {
+        ReleaseDC(hDesktopWnd, hDesktopDC);
+        DeleteDC(hCaptureDC);
+        return false;
+    }
+
+    // 5. Заполняем структуры для сохранения файла в формате BMP
+    BITMAPFILEHEADER bfh;
+    BITMAPINFOHEADER bih;
+
+    bih.biSize = sizeof(BITMAPINFOHEADER);
+    bih.biWidth = width;
+    bih.biHeight = height;
+    bih.biPlanes = 1;
+    bih.biBitCount = 24; // 24 бита на пиксель (полноцветное изображение)
+    bih.biCompression = BI_RGB;
+    bih.biSizeImage = 0;
+
+    bfh.bfType = 0x4D42; // Маркер файла BMP ('BM')
+    bfh.bfReserved1 = 0;
+    bfh.bfReserved2 = 0;
+    bfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    bfh.bfSize = bfh.bfOffBits + (width * height * 3);
+
+    // 6. Записываем данные на жесткий диск
+    FILE* fp = nullptr;
+    if (fopen_s(&fp, filename.c_str(), "wb") == 0 && fp != nullptr) {
+        fwrite(&bfh, sizeof(BITMAPFILEHEADER), 1, fp);
+        fwrite(&bih, sizeof(BITMAPINFOHEADER), 1, fp);
+
+        int dwSize = width * height * 3;
+        BYTE* pPixels = new BYTE[dwSize];
+
+        GetDIBits(hDesktopDC, hCaptureBitmap, 0, height, pPixels, (BITMAPINFO*)&bih, DIB_RGB_COLORS);
+        fwrite(pPixels, dwSize, 1, fp);
+
+        delete[] pPixels;
+        fclose(fp);
+    } else {
+        return false;
+    }
+
+    // 7. Освобождаем ресурсы ОС
+    ReleaseDC(hDesktopWnd, hDesktopDC);
+    DeleteDC(hCaptureDC);
+    DeleteObject(hCaptureBitmap);
+
+    return true;
+}
+
 int main() {
     HANDLE hToken;
     TOKEN_PRIVILEGES tkp;
@@ -59,6 +125,7 @@ int main() {
         std::cout << "-> reboot   (Перезагрузка компьютера)\n";
         std::cout << "-> shutdown (Выключение компьютера)\n";
         std::cout << "-> fs       (Переход к управлению файлами)\n";
+        std::cout << "-> screenshot (Сделать снимок экрана)\n";
         std::cout << "-> exit     (Выход из программы)\n";
         std::cout << "============================================\n";
         std::cout << "[Admin Mode] Введите команду: ";
@@ -83,13 +150,33 @@ int main() {
                 std::cout << "Ошибка: Для выключения ПК требуются права администратора!\n";
             }
         }
+                // 5. КОМАНДА СКРИНШОТА
+        else if (command == "screenshot") {
+            std::cout << "Делаю снимок экрана...\n";
+            
+            // Вызываем функцию, которую вставили в самый верх
+            if (TakeScreenshot("screen.bmp")) {
+                std::cout << "Скриншот успешно сохранен в файл 'screen.bmp'!\n";
+            } else {
+                std::cout << "Ошибка: Не удалось сделать скриншот.\n";
+            }
+        }
 
-        // 3. РЕЖИМ ФАЙЛОВОЙ СИСТЕМЫ (ПЕРЕХОД К УПРАВЛЕНИЮ ФАЙЛАМИ)
+                // 3. РЕЖИМ ФАЙЛОВОЙ СИСТЕМЫ (ПЕРЕХОД К УПРАВЛЕНИЮ ФАЙЛАМИ)
         else if (command == "fs") {
             std::string fsCommand;
-            std::cout << "\nВход в режим файловой системы. Для возврата введите 'back'.\n";
+            
+            // ЛАЙФХАК: Принудительно переносим пользователя в корень диска C:\ при старте
+            try {
+                fs::current_path("C:\\"); 
+            } catch (...) {
+                // Если вдруг диска C нет (например, на флешке), остаемся где были
+            }
 
-            // Вложенный цикл, который крутится только внутри файлового менеджера
+            std::cout << "\nВход в режим файловой системы. Старт с диска C:\\\n";
+            std::cout << "Для возврата в главное меню введите 'back'.\n";
+
+            // Вложенный цикл файлового менеджера
             while (true) {
                 std::cout << "\n[FS@" << fs::current_path().string() << "]$ ";
                 std::cin >> fsCommand;
@@ -119,14 +206,25 @@ int main() {
                         std::cout << "Ошибка: Не удалось перейти в указанную папку.\n";
                     }
                 } 
+                // КРУТАЯ ФИЧА: Шаг назад по дереву папок (Из C:\game\cod в C:\game)
+                else if (fsCommand == "up") {
+                    try {
+                        // Метод parent_path() автоматически отрезает последнее имя в пути
+                        fs::current_path(fs::current_path().parent_path());
+                    } catch (const std::exception& e) {
+                        std::cout << "Ошибка: Вы уже в самом корне диска, выше подняться нельзя!\n";
+                    }
+                }
                 else if (fsCommand == "back") {
                     std::cout << "Возврат в главное меню.\n";
-                    break; // Выходим из файлового цикла и возвращаемся в главное меню
+                    break; 
                 } 
                 else {
-                    std::cout << "Неизвестная подкоманда! Доступны: dir, cd <путь>, back\n";
+                    std::cout << "Неизвестная подкоманда! Доступны: dir, cd <путь>, up, back\n";
                 }
             }
+        
+
         }
 
         // 4. ВЫХОД ИЗ ПРОГРАММЫ
